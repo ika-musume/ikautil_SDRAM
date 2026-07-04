@@ -1,0 +1,267 @@
+ucode windows, freq=110 CL=3 (start cycles ALLOWED per candidate class)
+
+HOW TO READ THIS FILE
+=====================
+This is the human-readable form of the interleaving research in
+docs/ikautil_sdram.xlsx as compiled into the operation-unit microcode by
+scripts/gen_ucode.py. For every operation type that can be IN FLIGHT it
+lists WHEN a new operation may START, in controller clock cycles relative
+to the in-flight op's own start (cycle 0 = its first command: ACT for
+'act' ops, the READ/WRITE CAS for 'col' ops, AREF for 'ref'). Both ops
+reach the SDRAM pins through the same pipeline, so only these relative
+numbers matter - the cycle scale is identical to the spreadsheet's own
+cycle row.
+
+Sections
+  [DED]  dedicated DQM pins (Analogue Pocket / direct-routed chips):
+         the spreadsheet windows verbatim (cross-checked cell-by-cell).
+  [SHR]  MiSTer 128MB module (chip DQM pins wired to A[12:11]): ACT is
+         additionally forbidden while any op needs DQM low, because an
+         ACTIVATE would drive its row[12:11] bits onto the DQM nets.
+  chipN (BL=x): windows for ops running on chip N with that chip's MRS
+         burst length; chip0/chip1 differ when BL0 != BL1.
+
+Current-op line: cur=<kind><R|W>  len=<n>
+  colR/colW  CAS-only op to an already-open row   (CAS at cycle 0)
+  actR/actW  activate + CAS, bank was precharged  (ACT at 0, CAS at tRCD)
+  refR       auto refresh; occupies its whole chip for tRFC
+  len        cycles the op occupies an operation unit (data + guard tail)
+
+Candidate rows: <class>_<sc|dc> : list of ALLOWED start cycles s
+  A new op of that class may issue its FIRST command s cycles after the
+  current op's cycle 0. _sc = candidate on the SAME chip as the current
+  op; _dc = candidate on the OTHER chip (computed with the other chip's
+  BL; tRRD does not bind across chips, but a 1-cycle DQ handover gap is
+  added for cross-chip read-to-read). '-' = never while this op is in
+  flight. s runs 1..len; after the op retires (s > len) everything is
+  allowed, subject only to the bank tracker guards (tRC/tRAS/tRP/tWR),
+  which are enforced separately and NOT encoded in these windows.
+
+A cycle is absent from a row when any of these would be violated:
+  command-bus slot conflict; DQ data overlap; read->write turnaround
+  (one Z cycle); same-chip CAS would truncate an in-flight write burst;
+  candidate read's DQM-low window overlaps a write's (possibly padding-
+  masked) data cycles; tRRD (same chip); cross-chip read->read handover;
+  [SHR only] candidate ACT falls inside a DQM-critical window.
+
+Correspondence to the spreadsheet (same chip, [DED], cur=actR/actW):
+  actX_sc rows = the sheet's 'diff bank' R / RW marks
+  colX_sc rows = the sheet's 'same bank col acc' ColR / ColRW marks
+  (write windows are guarded slightly harder than the sheet, which
+  assumed trailing write beats are padding - see gen_ucode.py header)
+
+Note: in the ucode ROM these windows are stored one word early (word c
+gates a start at cycle c+1) because the issue stage decides one cycle
+ahead of the op units.
+
+Worked example ([DED] chip0 BL=4, cur=actR, len=13):
+  cycle:    0    1    2    3    4    5    6    7    8    9   10   11   12
+  cmd  :  ACT    -    - READ    -    -    -    -    -    -    -    -    -
+  DQ   :    -    -    -    -    -    -   D0   D1   D2   D3    -    -    -
+  actR_sc starts at 4: a same-chip read issues its ACT at 4, its CAS
+  lands at 7 and its data at 10-13, seamlessly after D3.
+  colR_sc starts at 7: an open-row read CAS at 7 -> data at 10-13.
+  colW_sc starts at 11: a write may not drive DQ until one dead cycle
+  after the read data, so the earliest write CAS is 11.
+
+========================================================================
+
+[DED] chip0 (BL=4) cur=colR len=10
+  colR_sc : 4 5 6 7 8 9 10
+  colW_sc : 8 9 10
+  actR_sc : 1 2 3 4 5 6 7 8 9 10
+  actW_sc : 5 6 7 8 9 10
+  colR_dc : 5 6 7 8 9 10
+  colW_dc : 8 9 10
+  actR_dc : 2 3 4 5 6 7 8 9 10
+  actW_dc : 5 6 7 8 9 10
+
+[DED] chip0 (BL=4) cur=colW len=5
+  colR_sc : 4 5
+  colW_sc : 4 5
+  actR_sc : 1 2 3 4 5
+  actW_sc : 1 2 3 4 5
+  colR_dc : 3 4 5
+  colW_dc : 4 5
+  actR_dc : 1 2 3 4 5
+  actW_dc : 1 2 3 4 5
+
+[DED] chip0 (BL=4) cur=actR len=13
+  colR_sc : 7 8 9 10 11 12 13
+  colW_sc : 11 12 13
+  actR_sc : 4 5 6 7 8 9 10 11 12 13
+  actW_sc : 8 9 10 11 12 13
+  colR_dc : 8 9 10 11 12 13
+  colW_dc : 11 12 13
+  actR_dc : 5 6 7 8 9 10 11 12 13
+  actW_dc : 8 9 10 11 12 13
+
+[DED] chip0 (BL=4) cur=actW len=8
+  colR_sc : 7 8
+  colW_sc : 7 8
+  actR_sc : 4 5 6 7 8
+  actW_sc : 4 5 6 7 8
+  colR_dc : 6 7 8
+  colW_dc : 7 8
+  actR_dc : 4 5 6 7 8
+  actW_dc : 4 5 6 7 8
+
+[DED] chip0 (BL=4) cur=refR len=7
+  colR_sc : 7
+  colW_sc : 7
+  actR_sc : 7
+  actW_sc : 7
+  colR_dc : 1 2 3 4 5 6 7
+  colW_dc : 1 2 3 4 5 6 7
+  actR_dc : 1 2 3 4 5 6 7
+  actW_dc : 1 2 3 4 5 6 7
+
+[DED] chip1 (BL=4) cur=colR len=10
+  colR_sc : 4 5 6 7 8 9 10
+  colW_sc : 8 9 10
+  actR_sc : 1 2 3 4 5 6 7 8 9 10
+  actW_sc : 5 6 7 8 9 10
+  colR_dc : 5 6 7 8 9 10
+  colW_dc : 8 9 10
+  actR_dc : 2 3 4 5 6 7 8 9 10
+  actW_dc : 5 6 7 8 9 10
+
+[DED] chip1 (BL=4) cur=colW len=5
+  colR_sc : 4 5
+  colW_sc : 4 5
+  actR_sc : 1 2 3 4 5
+  actW_sc : 1 2 3 4 5
+  colR_dc : 3 4 5
+  colW_dc : 4 5
+  actR_dc : 1 2 3 4 5
+  actW_dc : 1 2 3 4 5
+
+[DED] chip1 (BL=4) cur=actR len=13
+  colR_sc : 7 8 9 10 11 12 13
+  colW_sc : 11 12 13
+  actR_sc : 4 5 6 7 8 9 10 11 12 13
+  actW_sc : 8 9 10 11 12 13
+  colR_dc : 8 9 10 11 12 13
+  colW_dc : 11 12 13
+  actR_dc : 5 6 7 8 9 10 11 12 13
+  actW_dc : 8 9 10 11 12 13
+
+[DED] chip1 (BL=4) cur=actW len=8
+  colR_sc : 7 8
+  colW_sc : 7 8
+  actR_sc : 4 5 6 7 8
+  actW_sc : 4 5 6 7 8
+  colR_dc : 6 7 8
+  colW_dc : 7 8
+  actR_dc : 4 5 6 7 8
+  actW_dc : 4 5 6 7 8
+
+[DED] chip1 (BL=4) cur=refR len=7
+  colR_sc : 7
+  colW_sc : 7
+  actR_sc : 7
+  actW_sc : 7
+  colR_dc : 1 2 3 4 5 6 7
+  colW_dc : 1 2 3 4 5 6 7
+  actR_dc : 1 2 3 4 5 6 7
+  actW_dc : 1 2 3 4 5 6 7
+
+[SHR] chip0 (BL=4) cur=colR len=10
+  colR_sc : 4 5 6 7 8 9 10
+  colW_sc : 8 9 10
+  actR_sc : 5 6 7 8 9 10
+  actW_sc : 5 6 7 8 9 10
+  colR_dc : 5 6 7 8 9 10
+  colW_dc : 8 9 10
+  actR_dc : 5 6 7 8 9 10
+  actW_dc : 5 6 7 8 9 10
+
+[SHR] chip0 (BL=4) cur=colW len=5
+  colR_sc : 4 5
+  colW_sc : 4 5
+  actR_sc : 4 5
+  actW_sc : 4 5
+  colR_dc : 3 4 5
+  colW_dc : 4 5
+  actR_dc : 4 5
+  actW_dc : 4 5
+
+[SHR] chip0 (BL=4) cur=actR len=13
+  colR_sc : 7 8 9 10 11 12 13
+  colW_sc : 11 12 13
+  actR_sc : 8 9 10 11 12 13
+  actW_sc : 8 9 10 11 12 13
+  colR_dc : 8 9 10 11 12 13
+  colW_dc : 11 12 13
+  actR_dc : 8 9 10 11 12 13
+  actW_dc : 8 9 10 11 12 13
+
+[SHR] chip0 (BL=4) cur=actW len=8
+  colR_sc : 7 8
+  colW_sc : 7 8
+  actR_sc : 7 8
+  actW_sc : 7 8
+  colR_dc : 6 7 8
+  colW_dc : 7 8
+  actR_dc : 7 8
+  actW_dc : 7 8
+
+[SHR] chip0 (BL=4) cur=refR len=7
+  colR_sc : 7
+  colW_sc : 7
+  actR_sc : 7
+  actW_sc : 7
+  colR_dc : 1 2 3 4 5 6 7
+  colW_dc : 1 2 3 4 5 6 7
+  actR_dc : 1 2 3 4 5 6 7
+  actW_dc : 1 2 3 4 5 6 7
+
+[SHR] chip1 (BL=4) cur=colR len=10
+  colR_sc : 4 5 6 7 8 9 10
+  colW_sc : 8 9 10
+  actR_sc : 5 6 7 8 9 10
+  actW_sc : 5 6 7 8 9 10
+  colR_dc : 5 6 7 8 9 10
+  colW_dc : 8 9 10
+  actR_dc : 5 6 7 8 9 10
+  actW_dc : 5 6 7 8 9 10
+
+[SHR] chip1 (BL=4) cur=colW len=5
+  colR_sc : 4 5
+  colW_sc : 4 5
+  actR_sc : 4 5
+  actW_sc : 4 5
+  colR_dc : 3 4 5
+  colW_dc : 4 5
+  actR_dc : 4 5
+  actW_dc : 4 5
+
+[SHR] chip1 (BL=4) cur=actR len=13
+  colR_sc : 7 8 9 10 11 12 13
+  colW_sc : 11 12 13
+  actR_sc : 8 9 10 11 12 13
+  actW_sc : 8 9 10 11 12 13
+  colR_dc : 8 9 10 11 12 13
+  colW_dc : 11 12 13
+  actR_dc : 8 9 10 11 12 13
+  actW_dc : 8 9 10 11 12 13
+
+[SHR] chip1 (BL=4) cur=actW len=8
+  colR_sc : 7 8
+  colW_sc : 7 8
+  actR_sc : 7 8
+  actW_sc : 7 8
+  colR_dc : 6 7 8
+  colW_dc : 7 8
+  actR_dc : 7 8
+  actW_dc : 7 8
+
+[SHR] chip1 (BL=4) cur=refR len=7
+  colR_sc : 7
+  colW_sc : 7
+  actR_sc : 7
+  actW_sc : 7
+  colR_dc : 1 2 3 4 5 6 7
+  colW_dc : 1 2 3 4 5 6 7
+  actR_dc : 1 2 3 4 5 6 7
+  actW_dc : 1 2 3 4 5 6 7
