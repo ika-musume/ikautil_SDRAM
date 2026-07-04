@@ -3,23 +3,47 @@
 # The Micron model's three delayed DQ assignments are unsupported tristate
 # constructs in Verilator; they are converted to plain NBAs at build time
 # (cycle-accurate for posedge sampling since tMiST=0).
+#
+# TIER=70 (default) runs the DUT's default configuration ("everything on":
+# all 12 slots) against the committed default ucode (f70, BL 4/1).
+# TIER=95 / TIER=110 run the slot-MERGED tiers: same SDRAM image and region
+# addresses, fewer ports (ROM folded pairwise at 95, ROM+RW at 110), with a
+# matching ucode generated into obj/.
 set -e
 cd "$(dirname "$0")"
 mkdir -p obj
+
+TIER="${TIER:-70}"
+case "$TIER" in
+    70)  INCDIR="+incdir+../src" ;;      #committed default ucode
+    95|110)
+        mkdir -p obj/gen$TIER
+        python3 ../scripts/gen_ucode.py --freq "$TIER" --bl0 4 --bl1 1 \
+            -o "obj/gen$TIER/ikautil_sdram_ucode.svh"
+        INCDIR="+incdir+obj/gen$TIER" ;;
+    *)   echo "TIER must be 70, 95 or 110"; exit 1 ;;
+esac
+MDIR="obj/verilated_t$TIER"
 
 # Memory preload: the model loads sdram_bank0..3.hex itself ($readmemh path,
 # LOADROM undefined + JTFRAME_SDRAM_BANKS defined). Hierarchical array writes
 # from the TB are avoided deliberately - under verilator --timing they leave
 # the model's own in-process array reads stale by one activation.
+# Both chips load the SAME files, and chip0 uses banks 2/3 as a second mirror
+# pair, so bank2 == bank3 (tag 2) and bank0 == bank1 (untagged). Files are
+# rewritten if their first word does not match this scheme.
 python3 - << 'EOF'
 import os
 N = 0x120000                 # preloaded words per bank (covers all TB addresses)
 def pat(i):  return (i & 0xFFFF) ^ ((i >> 16) << 9) & 0xFFFF
 for b in range(4):
     fn = f'sdram_bank{b}.hex'
+    x = 0 if b < 2 else 2    # pair1 = banks 0/1, pair2 = banks 2/3 (tag 2)
+    first = f'{(pat(0) ^ x):04x}'
     if os.path.exists(fn) and os.path.getsize(fn) > 0:
-        continue
-    x = 0 if b < 2 else b    # ROM mirror pair identical; RW banks tagged
+        with open(fn) as f:
+            if f.readline().strip() == first:
+                continue
     with open(fn, 'w') as f:
         f.write('\n'.join(f'{(pat(i) ^ x):04x}' for i in range(N)))
         f.write('\n')
@@ -47,12 +71,12 @@ verilator --timing --binary -j 4 \
     -DJTFRAME_SDRAM_BANKS -DSIMULATION \
     -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM \
     -Wno-CASEINCOMPLETE -Wno-INITIALDLY -Wno-BLKANDNBLK \
-    +incdir+../src \
+    $INCDIR -GTIER=$TIER \
     --top-module tb \
     ../src/ikautil_sdram.sv mister_128mb.sv ikautil_sdram_tb.sv obj/mt48lc16m16a2_sim.v \
-    -o tb_run --Mdir obj/verilated "$@"
+    -o tb_run --Mdir $MDIR "$@"
 
-obj/verilated/tb_run | tee obj/sim.log
+$MDIR/tb_run | tee obj/sim.log
 
 if grep -q "ERROR" obj/sim.log; then
     echo "== FAILED: errors in log =="

@@ -14,10 +14,32 @@
     DQM_SHARED=0 : dedicated DQM pins (Analogue Pocket / direct-routed chips);
                    spreadsheet windows verbatim (UCODE_DED).
 
-    Bank map (global bank = {chip, ba[1:0]}):
-      chip0: ba0/ba1 = ROM mirror pair, slots 0-3   ba2 = slot 8   ba3 = slot 9
-      chip1: ba0/ba1 = ROM mirror pair, slots 4-7   ba2 = slot 10  ba3 = slot 11
+    Bank map (global bank = {chip, ba[1:0]}) is set per slot by SLOTn_BANK.
+    ROM slots (0-7) name a mirror PAIR: the parameter is the even bank of the
+    pair, the partner is SLOTn_BANK ^ 3'b001. RW slots (8-11) name a private
+    bank. Defaults are the "everything on" reference config - all 12 slots
+    enabled at the 70MHz bin with per-chip burst lengths (BL0=4, BL1=1):
+      chip0: ba0/ba1 = ROM mirror pair, slots 0-3
+             ba2/ba3 = ROM mirror pair, slots 4-7
+      chip1: ba0 = RW slots 8 + 9 (9 stacked at SA 0x400000)
+             ba2 = RW slots 10 + 11 (11 stacked at SA 0x400000)
+             ba1/ba3 = free headroom
+    The stacked RW layout keeps the SDRAM image identical when adjacent slots
+    are merged pairwise to meet the slot limit at higher clocks (see README
+    "Changing the frequency and microcode").
     ROM data must be loaded identically into both banks of a mirror pair.
+    Legality (checked at elaboration, enabled slots only):
+      - ROM slots: SLOTn_BANK[0] must be 0 (pairs are ba0/ba1 or ba2/ba3)
+      - an RW slot's bank must not fall inside any ROM mirror pair (a writer
+        there would corrupt ROM data); RW slots MAY share a bank with each
+        other (stacked regions - they contend for the open row)
+      - SLOTn_DW/16 must not exceed the burst length of the slot's chip
+
+    Per-chip burst length: BL0/BL1 declare each chip's MRS burst length and
+    must match the generated ucode (rerun gen_ucode.py --bl0/--bl1 to change).
+    Chips may differ: e.g. BL0=4 for 64-bit ROM slots, BL1=1 for 16-bit RW
+    slots, so short accesses stop paying 4-beat DQ occupancy - group slots of
+    equal width per chip via SLOTn_BANK.
 
     Read data return, jtframe style: o_RDATA is the raw DQ capture register
     (same register jtframe calls dout - no extra latency); o_SLOTn_DST strobes
@@ -43,23 +65,32 @@
 */
 
 module ikautil_sdram #(
-    parameter integer FREQ       = 110,
+    parameter integer FREQ       = 70,
     parameter integer DQM_SHARED = 1,
     parameter integer CAP_DELAY  = 1,       //extra DQ capture latency (board/phase dependent)
     parameter integer INIT_PAUSE = 20000,   //cycles of power-up NOP
     parameter integer RFSHCNT    = 9,       //refresh commands queued per i_RFSH edge (per chip)
+    parameter integer BL0        = 4,       //chip0 MRS burst length; must match ucode (--bl0)
+    parameter integer BL1        = 1,       //chip1 MRS burst length; must match ucode (--bl1)
 
-    parameter         SLOT0_EN = 1, SLOT1_EN = 1, SLOT2_EN  = 0, SLOT3_EN  = 0,
-                      SLOT4_EN = 1, SLOT5_EN = 1, SLOT6_EN  = 0, SLOT7_EN  = 0,
-                      SLOT8_EN = 1, SLOT9_EN = 0, SLOT10_EN = 1, SLOT11_EN = 0,
+    parameter         SLOT0_EN = 1, SLOT1_EN = 1, SLOT2_EN  = 1, SLOT3_EN  = 1,
+                      SLOT4_EN = 1, SLOT5_EN = 1, SLOT6_EN  = 1, SLOT7_EN  = 1,
+                      SLOT8_EN = 1, SLOT9_EN = 1, SLOT10_EN = 1, SLOT11_EN = 1,
 
     parameter [22:0]  SLOT0_SA = 23'h00_0000, SLOT1_SA = 23'h10_0000, SLOT2_SA  = 23'h20_0000, SLOT3_SA  = 23'h30_0000,
                       SLOT4_SA = 23'h00_0000, SLOT5_SA = 23'h10_0000, SLOT6_SA  = 23'h20_0000, SLOT7_SA  = 23'h30_0000,
-                      SLOT8_SA = 23'h00_0000, SLOT9_SA = 23'h00_0000, SLOT10_SA = 23'h00_0000, SLOT11_SA = 23'h00_0000,
+                      SLOT8_SA = 23'h00_0000, SLOT9_SA = 23'h40_0000, SLOT10_SA = 23'h00_0000, SLOT11_SA = 23'h40_0000,
 
     parameter integer SLOT0_DW = 64, SLOT1_DW = 64, SLOT2_DW  = 64, SLOT3_DW  = 64,
                       SLOT4_DW = 64, SLOT5_DW = 64, SLOT6_DW  = 64, SLOT7_DW  = 64,
-                      SLOT8_DW = 16, SLOT9_DW = 16, SLOT10_DW = 16, SLOT11_DW = 16
+                      SLOT8_DW = 16, SLOT9_DW = 16, SLOT10_DW = 16, SLOT11_DW = 16,
+
+    //placement: global bank {chip, ba[1:0]}. ROM slots (0-7) name the even
+    //bank of their mirror pair (partner = bank ^ 3'b001), RW slots a private
+    //bank. See the header for the legality rules.
+    parameter [2:0]   SLOT0_BANK = 3'b000, SLOT1_BANK = 3'b000, SLOT2_BANK  = 3'b000, SLOT3_BANK  = 3'b000,
+                      SLOT4_BANK = 3'b010, SLOT5_BANK = 3'b010, SLOT6_BANK  = 3'b010, SLOT7_BANK  = 3'b010,
+                      SLOT8_BANK = 3'b100, SLOT9_BANK = 3'b100, SLOT10_BANK = 3'b110, SLOT11_BANK = 3'b110
     ) (
     input   wire            i_CLK,
     input   wire            i_RST_n,
@@ -154,6 +185,8 @@ localparam integer NSLOT_EN = SLOT0_EN+SLOT1_EN+SLOT2_EN+SLOT3_EN+SLOT4_EN+SLOT5
                             + SLOT6_EN+SLOT7_EN+SLOT8_EN+SLOT9_EN+SLOT10_EN+SLOT11_EN;
 initial begin
     if (FREQ != UC_FREQ)         $error("FREQ parameter does not match generated ucode; rerun gen_ucode.py");
+    if (BL0 != UC_BL0 || BL1 != UC_BL1)
+                                 $error("BL0/BL1 parameters do not match generated ucode (UC_BL0=%0d UC_BL1=%0d); rerun gen_ucode.py --bl0/--bl1", UC_BL0, UC_BL1);
     if (NSLOT_EN > SLOT_LIMIT)   $error("too many enabled slots for this frequency (limit %0d)", SLOT_LIMIT);
     if (FREQ > 132)              $error("FREQ above supported ceiling (132)");
 end
@@ -171,11 +204,40 @@ wire [NSLOT-1:0] slot_en = {SLOT11_EN[0], SLOT10_EN[0], SLOT9_EN[0], SLOT8_EN[0]
                             SLOT7_EN[0],  SLOT6_EN[0],  SLOT5_EN[0], SLOT4_EN[0],
                             SLOT3_EN[0],  SLOT2_EN[0],  SLOT1_EN[0], SLOT0_EN[0]};
 wire [NSLOT-1:0] slot_rom = 12'h0FF;                      //slots 0-7 read-only mirror pairs
-wire [NSLOT-1:0] slot_chip = 12'b1100_1111_0000;          //slots 4-7,10,11 on chip1
 
-function automatic [1:0] slot_ba0(input integer s);       //primary bank within chip
-    slot_ba0 = (s < 8) ? 2'd0 : (s == 8 || s == 10) ? 2'd2 : 2'd3;
-endfunction
+//placement map as elaboration constants (candidate logic + legality checks)
+localparam bit [2:0] SLOT_BANKS [0:NSLOT-1] = '{
+    SLOT0_BANK, SLOT1_BANK, SLOT2_BANK,  SLOT3_BANK,
+    SLOT4_BANK, SLOT5_BANK, SLOT6_BANK,  SLOT7_BANK,
+    SLOT8_BANK, SLOT9_BANK, SLOT10_BANK, SLOT11_BANK};
+localparam integer SLOT_DWS [0:NSLOT-1] = '{
+    SLOT0_DW, SLOT1_DW, SLOT2_DW,  SLOT3_DW,
+    SLOT4_DW, SLOT5_DW, SLOT6_DW,  SLOT7_DW,
+    SLOT8_DW, SLOT9_DW, SLOT10_DW, SLOT11_DW};
+localparam bit [NSLOT-1:0] SLOT_ENS = {SLOT11_EN[0], SLOT10_EN[0], SLOT9_EN[0], SLOT8_EN[0],
+                                       SLOT7_EN[0],  SLOT6_EN[0],  SLOT5_EN[0], SLOT4_EN[0],
+                                       SLOT3_EN[0],  SLOT2_EN[0],  SLOT1_EN[0], SLOT0_EN[0]};
+
+//placement legality (see header); enabled slots only
+integer ki, kj;
+initial begin
+    for (ki = 0; ki < NSLOT; ki = ki + 1) begin
+        if (SLOT_ENS[ki]) begin
+            if (SLOT_DWS[ki]/16 > (SLOT_BANKS[ki][2] ? BL1 : BL0))
+                $error("slot %0d: DW/16 (%0d beats) exceeds chip%0d burst length", ki, SLOT_DWS[ki]/16, SLOT_BANKS[ki][2]);
+            if (ki < 8 && SLOT_BANKS[ki][0])
+                $error("slot %0d: ROM slot must name the even bank of its mirror pair", ki);
+            //RW slots may share a bank with each other (stacked regions for
+            //slot merging); only a writer inside a ROM mirror pair is fatal
+            if (ki >= 8) begin
+                for (kj = 0; kj < 8; kj = kj + 1) begin
+                    if (SLOT_ENS[kj] && SLOT_BANKS[ki][2:1] == SLOT_BANKS[kj][2:1])
+                        $error("slot %0d: bank %b falls inside slot %0d's mirror pair", ki, SLOT_BANKS[ki], kj);
+                end
+            end
+        end
+    end
+end
 
 wire [22:0] slot_sa   [0:NSLOT-1];
 assign slot_sa[0]=SLOT0_SA; assign slot_sa[1]=SLOT1_SA; assign slot_sa[2]=SLOT2_SA;  assign slot_sa[3]=SLOT3_SA;
@@ -375,9 +437,9 @@ wire [2:0]  c_class [0:NSLOT-1];  //0 colR,1 colW,2 actR,3 actW,4 pre
 wire [2:0]  c_bank  [0:NSLOT-1];
 genvar gc;
 generate for (gc = 0; gc < NSLOT; gc = gc + 1) begin : g_cand
-    wire        chip = slot_chip[gc];
-    wire [2:0]  b0 = {chip, slot_ba0(gc)};
-    wire [2:0]  b1 = {chip, 2'd1};                       //mirror partner (ROM slots only)
+    wire        chip = SLOT_BANKS[gc][2];
+    wire [2:0]  b0 = SLOT_BANKS[gc];
+    wire [2:0]  b1 = SLOT_BANKS[gc] ^ 3'b001;            //mirror pair partner (ROM slots only)
     wire [12:0] row = req_addr[gc][22:10];
     wire        m0 = bk_open[b0] && bk_row[b0] == row;
     wire        m1 = slot_rom[gc] && bk_open[b1] && bk_row[b1] == row;
